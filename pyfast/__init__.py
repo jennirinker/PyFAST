@@ -6,15 +6,303 @@ Author : Jennifer M. Rinker
 
 Date   : 20-oct-2016
 """
-import os
-import scipy.io as scio
 import numpy as np
-from struct import unpack
-from warnings import warn
+import os
+import pandas as pd
+from   PyTurbSimLite import readModel
+import scipy.io as scio
+import shutil 
+    
 
-# =============================================================================
-#                  Reading/writing FAST input files
-# =============================================================================
+def CalcLookupTable(TurbName,ModlDir,WindDir=None,
+                    version=7,WindSpeeds=None,TMax=140.,Tss=80.,
+                    clean=0,**kwargs):
+    """ 
+    
+    Wind speeds must be increasing
+    FAST must be on your system path or in the ModlDir
+    """
+    
+    # check if model directory exists
+    if not os.path.isdir(ModlDir):
+        raise ValueError('Model directory {:s} does not exist.'.format(ModlDir))
+    
+    # check if steady-state directory exists, overwrite if user allows
+    SSDir = os.path.join(ModlDir,'steady-state')
+    if os.path.isdir(SSDir):
+        UserResp = input('Steady-state directory already exists. Overwrite? [y/n] ')
+        if UserResp in ['y','Y',1]:
+            shutil.rmtree('SSDir')
+            os.mkdir(SSDir)
+        elif UserResp in ['n','N',0]:
+            return None
+        else:
+            raise ValueError('Unknown response {}'.format(UserResp))
+    
+    # define default wind speeds, ensure monotonically increasing
+    if WindSpeeds is None:
+        WindSpeeds = np.arange(3,25,0.5)
+    else:
+        WindSpeeds = np.sort(np.array(WindSpeeds))
+        
+    # if the wind directory is not specified, make it the same as the SS directory
+    if WindDir is None:
+        WindDir = SSDir
+    
+    # define LUT name and path
+    SSName = TurbName + '_SS.mat'
+    SSPath = os.path.join(SSDir,SSName)
+    
+    # change directory to steady-state directory to run FAST
+    os.chdir(SSDir)
+    
+    # define initial dictionary of default wind-dependent parameters
+    WindDict = {'BlPitch(1)':0.,'BlPitch(2)':0.,'BlPitch(3)':0.,
+                'OoPDefl':0.,'IPDefl':0.,'TeetDefl':0.,'Azimuth':0.,
+                'RotSpeed':0.,'NacYaw':0.,'TTDspFA':0.,'TTDspSS':0.,
+                'TMax':TMax,'TStart':0.}
+                
+    # set initial values of passed-in keyword arguments
+    for key in kwargs:
+        if key in WindDict.keys():
+            WindDict[key] = kwargs[key]
+            
+    # TODO: fix where we're writing files, how to delete them
+    # TODO: exe name?
+    
+    # loop through wind speeds
+    NumIDs = int(np.ceil(np.log10(len(WindSpeeds))))
+    for iWS in range(len(WindSpeeds)):
+        WindSpeed = WindSpeeds[iWS]
+        
+        print('Processing wind speed {} of {}...'.format(iWS+1,len(WindSpeeds)))
+        
+        # define file ID for FAST run
+        fileID     = '{:.0f}'.format(iWS).zfill(NumIDs)
+        
+        # create wind filename
+        WindName = 'NoShr_'+'{:2.1f}'.format(WindSpeed).zfill(4)+'.wnd'
+        
+        # check if wind file exists, make it if not
+        WindPath = os.path.join(WindDir,WindName)
+        if not os.path.exists(WindPath):
+            WriteSteadyWind(WindSpeed,WindPath)
+                
+        # write FAST input files
+        FastName = TurbName + '_' + fileID
+        FastPath = os.path.join(SSDir,FastName)
+        WriteFastAD(TurbName,WindPath,ModlDir,
+                    FastDir=SSDir,FastName=FastName,
+                    **WindDict)
+                  
+        # run FAST
+        command  = 'FAST.exe ' + FastName + '.fst' 
+        ExitCode = os.system(command)
+        if ExitCode:
+            print('WARNING: FAST did not complete successfully ' + \
+                    '(Wind speed {:.1f}, exit code {:.0f})'.format(WindSpeed,ExitCode))
+                      
+        # load FAST files
+        FASTdf = ReadFASTFile(FastName + '.out')
+        Fields = FASTdf.columns
+        
+        # initialize LUT if it doesn't exist
+        if iWS == 0: LUT = np.empty((len(WindSpeeds),len(Fields)))
+        
+        # loop through and save steady-state values
+        n_t = FASTdf['Time'].size*Tss/TMax
+        for i_parm in range(len(Fields)):
+            
+            # get data
+            parm = Fields[i_parm]
+            x = FASTdf[parm]
+                          
+            # calculate and save last value
+            x_SS = np.mean(x[-n_t:])
+            LUT[iWS,i_parm] = x_SS
+                                  
+        # set initial conditions for next round
+        for key in WindDict.keys():
+            if key in Fields:
+                WindDict[key] = LUT[iWS,Fields.index(key)]
+            elif key+'1' in Fields:
+                WindDict[key] = LUT[iWS,Fields.index(key+'1')]
+
+        # delete input files, move to steady-state
+        if clean:
+            os.system('del ' + FastName + '.fst')
+            os.system('del ' + FastName + '.out')
+            os.system('del ' + FastName + '_AD.ipt')
+    
+    print('Simulations completed.')    
+       
+    # rearrange to increasing wind speed
+    LUT = LUT[LUT[:,Fields.index('WindVxi')].argsort()]
+       
+    # save LUT   
+    LUTdict = {}
+    LUTdict['SS'] = LUT   
+    LUTdict['Fields'] = Fields 
+    scio.savemat(SSPath,LUTdict)
+    print('Look-up table saved.')
+    return LUT 
+    
+
+def DefaultOutputs():
+    """ Defaults outputs for FAST time-marching analysis
+    
+        Returns:
+            FastOutputs (list) : default outputs for time-marching analyses
+    """
+    FastOutputs = ['"WindVxi,WindVyi,WindVzi"          		- Wind-speed components\n',
+    '"OoPDefl1,IPDefl1,TipDzb1,TwrClrnc1"	- Blade 1 tip motions\n',
+    '"OoPDefl2,IPDefl2,TipDzb2,TwrClrnc2"	- Blade 2 tip motions\n',
+    '"OoPDefl3,IPDefl3,TipDzb3,TwrClrnc3"	- Blade 3 tip motions\n',
+    '"BldPitch1,BldPitch2,BldPitch3"         - Blade pitch motions\n',
+    '"Azimuth,RotSpeed,RotAccel"		        - LSS motion\n',
+    '"GenSpeed,GenAccel"				    	- HSS motion\n',
+    '"TTDspFA,TTDspSS,TTDspAx"				- Towertop motions\n',
+    '"YawBrTAxp,YawBrTAyp,YawBrTAzp"			- Towertop accelerations\n',
+    '"RootFzb1,RootMIP1,RootMOoP1,RootMzb1"	- Blade 1 root loads (1/2)\n',
+    '"RootMEdg1,RootMFlp1"					- Blade 1 root loads (2/2)\n',
+    '"RootFzb2,RootMIP2,RootMOoP2,RootMzb2"	- Blade 2 root loads (1/2)\n',
+    '"RootMEdg2,RootMFlp2"					- Blade 2 root loads (2/2)\n',
+    '"RootFzb3,RootMIP3,RootMOoP3,RootMzb3"	- Blade 3 root loads (1/2)\n',
+    '"RootMEdg3,RootMFlp3"					- Blade 3 root loads (2/2)\n',
+    '"RotThrust,LSSGagFya,LSSGagFza"			- Hub and rotor loads (1/3)\n',
+    '"LSSGagFys,LSSGagFzs,RotTorq"			- Hub and rotor loads (2/3)\n',
+    '"LSShftPwr"								- Hub and rotor loads (3/3)\n',
+    '"HSShftTq,HSShftPwr"					- Generator and HSS loads\n',
+    '"GenPwr"								- Generator power\n',
+    '"YawBrFzp,YawBrMzp"						- Tower top yaw-bearing loads\n',
+    '"TwrBsFxt,TwrBsFyt,TwrBsFzt"			- Tower base loads (1/2)\n',
+    '"TwrBsMxt,TwrBsMyt,TwrBsMzt"			- Tower base loads (2/2)\n']
+    
+    return FastOutputs
+	
+ 
+def GetFirstWind(WindPath):
+    """ First wind speed from file
+    
+        Args:
+            WindPath (string): path to wind file
+            
+        Returns:
+            u0 (float): initial wind value
+    """
+    
+    # if it's a .wnd file
+    if WindPath.endswith('.wnd'):
+        
+        # try to read it as a text file
+        try:
+            with open(WindPath,'r') as f:
+                f.readline()
+                f.readline()
+                f.readline()
+                first_line = f.readline().split()
+                u0 = float(first_line[1])
+                
+        # if error, try to read as binary file
+        except:
+            turb  = readModel(WindPath)         # read file
+            u0    = turb[0,:,:,0].mean()        # take mean of u(t0)
+    
+    # if it's a .bts file
+    elif WindPath.endswith('.bts'):
+        
+        turb  = readModel(WindPath)             # read file
+        u0    = turb[0,:,:,0].mean()            # take mean of u(t0)
+        
+    # if it's a .bl file
+    elif WindPath.endswith('.bl'):
+        
+        turb  = readModel(WindPath)             # read file
+        u0    = turb[0,:,:,0].mean()            # take mean of u(t0)
+
+    else:
+        errStr = 'Uncoded file extension ' + \
+                        '\"{:s}\"'.format(WindPath.endswith())
+        raise ValueError(errStr)
+        
+    return u0  
+    
+
+def GetICKeys():
+    """ List of keys in .fst that are initial conditions
+    
+        Returns:
+            IC_keys (list): list of FAST keys that are initial conditions
+    """
+    
+    IC_keys = ['BlPitch(1)','BlPitch(2)','BlPitch(3)',
+                'OoPDefl','IPDefl','TeetDefl','Azimuth',
+                'RotSpeed','TTDspFA','TTDspSS']
+    
+    return IC_keys
+
+
+def ReadFASTFile(FilePath):
+    """ Read FAST data into pandas dataframe
+    
+        Args:
+            FilePath (string): path to .fst file
+    
+        Returns:
+            FASTDict (dictionary): dictionary with FAST data
+    """
+    
+    # number of lines to skip at the beginning of the file
+    SkipRows = 8
+    
+    # get field names and units
+    with open(FilePath,'r') as f:
+        for i in range(6):
+            f.readline()
+        Fields = f.readline().strip('\n').split()
+        Units  = f.readline().strip('\n').split()
+    Fields = [str(s) for s in Fields]  # replace weird character
+    Units  = [s.replace('\xb7','-') for s in Units]  # replace weird character
+        
+    # read as pandas dataframe
+    FASTdf = pd.read_csv(FilePath,
+                         delim_whitespace=True,header=0,names=Fields,
+                         skiprows=SkipRows)
+    FASTdf.units = Units
+    
+    return FASTdf
+    
+
+def ReplaceVal(Line,WriteFile,WindDict):
+    """ Replace the value in the line with value in WindDict
+        
+        Args:
+            Line       (str) : line with value to replace
+            WriteFile (file) : file object to be written to
+            WindDict  (dict) : dictionary with input file values
+    """
+    
+    # determine which field line corresponds to
+    Field = Line.split()[1]
+    
+    # if it's the output line, write all outputs for time-marching analysis or
+    #    none for a linearization analysis
+    if Field == 'FastOutputs':
+        FastOutputs = WindDict['FastOutputs']
+        if FastOutputs is None:
+            WriteFile.write('')
+        else:
+            for OutLine in FastOutputs:
+                WriteFile.write(OutLine)
+                
+    # for all other fields, just substitue the field into the line
+    else:
+        NewLine = Field.join([Line.split(Field)[0].format(WindDict[Field]),
+                              Line.split(Field)[1]])
+        WriteFile.write(NewLine)
+    
+    return
+
 
 def WriteFastAD(TurbName,WindPath,ModlDir,
                 FastDir=None,FastName=None,version=7,verbose=0,lin=0,
@@ -247,336 +535,23 @@ def WriteFastADAll(TurbName,ModlDir,WindDir,
                     **kwargs)
     
     return WindPaths
-    
 
-def ReplaceVal(Line,WriteFile,WindDict):
-    """ Replace the value in the line with value in WindDict
-        
+
+def WriteSteadyWind(WindSpeed,WindPath):
+    """ Write steady-state wind file
+    
         Args:
-            Line       (str) : line with value to replace
-            WriteFile (file) : file object to be written to
-            WindDict  (dict) : dictionary with input file values
+            WindSpeed (float): wind value
+            WindPath (string): optional path to directory with wind files
     """
     
-    # determine which field line corresponds to
-    Field = Line.split()[1]
-    
-    # if it's the output line, write all outputs for time-marching analysis or
-    #    none for a linearization analysis
-    if Field == 'FastOutputs':
-        FastOutputs = WindDict['FastOutputs']
-        if FastOutputs is None:
-            WriteFile.write('')
-        else:
-            for OutLine in FastOutputs:
-                WriteFile.write(OutLine)
-                
-    # for all other fields, just substitue the field into the line
-    else:
-        NewLine = Field.join([Line.split(Field)[0].format(WindDict[Field]),
-                              Line.split(Field)[1]])
-        WriteFile.write(NewLine)
-    
+    with open(WindPath,'w') as f:
+        f.write('! Wind file for steady {:.1f} m/s wind without shear.\n'.format(WindSpeed))
+        f.write('! Time	Wind	Wind	Vert.	Horiz.	Vert.	LinV	Gust\n')
+        f.write('!	Speed	Dir	Speed	Shear	Shear	Shear	Speed\n')
+        f.write('   0.0\t{:.1f}\t0.0\t0.0\t0.0\t0.0\t0.0\t0.0\n'.format(WindSpeed))
+        f.write('   0.1\t{:.1f}\t0.0\t0.0\t0.0\t0.0\t0.0\t0.0\n'.format(WindSpeed))
+        f.write('9999.9\t{:.1f}\t0.0\t0.0\t0.0\t0.0\t0.0\t0.0\n'.format(WindSpeed))
+        
     return
-    
-# =============================================================================
-#                  Miscellaneous utilities
-# =============================================================================
 
-def DefaultOutputs():
-    """ Defaults outputs for FAST time-marching analysis
-    
-        Returns:
-            FastOutputs (list) : default outputs for time-marching analyses
-    """
-    FastOutputs = ['"WindVxi,WindVyi,WindVzi"          		- Wind-speed components\n',
-    '"OoPDefl1,IPDefl1,TipDzb1,TwrClrnc1"	- Blade 1 tip motions\n',
-    '"OoPDefl2,IPDefl2,TipDzb2,TwrClrnc2"	- Blade 2 tip motions\n',
-    '"OoPDefl3,IPDefl3,TipDzb3,TwrClrnc3"	- Blade 3 tip motions\n',
-    '"BldPitch1,BldPitch2,BldPitch3"         - Blade pitch motions\n',
-    '"Azimuth,RotSpeed,RotAccel"		        - LSS motion\n',
-    '"GenSpeed,GenAccel"				    	- HSS motion\n',
-    '"TTDspFA,TTDspSS,TTDspAx"				- Towertop motions\n',
-    '"YawBrTAxp,YawBrTAyp,YawBrTAzp"			- Towertop accelerations\n',
-    '"RootFzb1,RootMIP1,RootMOoP1,RootMzb1"	- Blade 1 root loads (1/2)\n',
-    '"RootMEdg1,RootMFlp1"					- Blade 1 root loads (2/2)\n',
-    '"RootFzb2,RootMIP2,RootMOoP2,RootMzb2"	- Blade 2 root loads (1/2)\n',
-    '"RootMEdg2,RootMFlp2"					- Blade 2 root loads (2/2)\n',
-    '"RootFzb3,RootMIP3,RootMOoP3,RootMzb3"	- Blade 3 root loads (1/2)\n',
-    '"RootMEdg3,RootMFlp3"					- Blade 3 root loads (2/2)\n',
-    '"RotThrust,LSSGagFya,LSSGagFza"			- Hub and rotor loads (1/3)\n',
-    '"LSSGagFys,LSSGagFzs,RotTorq"			- Hub and rotor loads (2/3)\n',
-    '"LSShftPwr"								- Hub and rotor loads (3/3)\n',
-    '"HSShftTq,HSShftPwr"					- Generator and HSS loads\n',
-    '"GenPwr"								- Generator power\n',
-    '"YawBrFzp,YawBrMzp"						- Tower top yaw-bearing loads\n',
-    '"TwrBsFxt,TwrBsFyt,TwrBsFzt"			- Tower base loads (1/2)\n',
-    '"TwrBsMxt,TwrBsMyt,TwrBsMzt"			- Tower base loads (2/2)\n']
-    
-    return FastOutputs
-
-def GetICKeys():
-    """ List of keys in .fst that are initial conditions
-    
-        Returns:
-            IC_keys (list): list of FAST keys that are initial conditions
-    """
-    
-    IC_keys = ['BlPitch(1)','BlPitch(2)','BlPitch(3)',
-                'OoPDefl','IPDefl','TeetDefl','Azimuth',
-                'RotSpeed','TTDspFA','TTDspSS']
-    
-    return IC_keys
-	
- 
-def GetFirstWind(WindPath):
-    """ First wind speed from file
-    
-        Args:
-            WindPath (string): path to wind file
-            
-        Returns:
-            u0 (float): initial wind value
-    """
-    
-    # if it's a .wnd file
-    if WindPath.endswith('.wnd'):
-        
-        # try to read it as a text file
-        try:
-            with open(WindPath,'r') as f:
-                f.readline()
-                f.readline()
-                f.readline()
-                first_line = f.readline().split()
-                u0 = float(first_line[1])
-                
-        # if error, try to read as binary file
-        except:
-            turb  = readModel(WindPath)         # read file
-            u0    = turb[0,:,:,0].mean()        # take mean of u(t0)
-    
-    # if it's a .bts file
-    elif WindPath.endswith('.bts'):
-        
-        turb  = readModel(WindPath)             # read file
-        u0    = turb[0,:,:,0].mean()            # take mean of u(t0)
-        
-    # if it's a .bl file
-    elif WindPath.endswith('.bl'):
-        
-        turb  = readModel(WindPath)             # read file
-        u0    = turb[0,:,:,0].mean()            # take mean of u(t0)
-
-    else:
-        errStr = 'Uncoded file extension ' + \
-                        '\"{:s}\"'.format(WindPath.endswith())
-        raise ValueError(errStr)
-        
-    return u0
-    
-
-# =============================================================================
-#                  Utilities copied from PyTurbSim
-# =============================================================================
-# Subsequent code copied from PyTurbSim functions to load turbsim output.
-# Modified only slightly to be placed in this module.
-#
-# Code author:    Levi Kilcher
-# TurbSim GitHub: http://lkilcher.github.io/pyTurbSim/
-
-def readModel(fname, ):
-    """
-    Read a TurbSim data and input file and return a
-    :class:`tsdata <pyts.main.tsdata>` data object.
-
-    Parameters
-    ----------
-    fname : str
-            The filename to load.
-            If the file ends in:
-              .bl or .wnd,  the file is assumed to be a bladed-format file.
-              .bts, the file is assumed to be a TurbSim-format file.
-    Returns
-    -------
-    turb : :class:`numpy.ndarray`
-             [3 x n_z x n_y x n_t] array of wind velocity values
-    """
-    
-    if (fname.endswith('wnd')):
-        return bladed(fname,)
-    elif (fname.endswith('bl')):
-        return bladed(fname,)
-    elif (fname.endswith('bts')):
-        return turbsim(fname,)
-
-    # Otherwise try reading it as a .wnd file.
-    bladed(fname)  # This will raise an error if it doesn't work.    
-    
-    
-def bladed(fname,):
-    """
-    Read Bladed format (.wnd, .bl) full-field time-series binary data files.
-
-    Parameters
-    ----------
-    fname : str
-            The filename from which to read the data.
-
-    Returns
-    -------
-    turb : :class:`numpy.ndarray`
-             [3 x n_z x n_y x n_t] array of wind velocity values
-
-    """
-    e = '<'         # define "endianness"
-    fname = checkname(fname, ['.wnd', '.bl'])
-    with file(fname, 'rb') as fl:
-        junk, nffc, ncomp, lat, z0, center = unpack(e + '2hl3f', fl.read(20))
-        if junk != -99 or nffc != 4:
-            raise IOError("The file %s does not appear to be a valid 'bladed (.bts)' format file."
-                          % fname)
-        ti = np.array(unpack(e + '3f', fl.read(12))) / 100
-        dz, dy, dx, n_f, uhub = unpack(e + '3flf', fl.read(20))
-        n_t = int(2 * n_f)
-        fl.seek(12, 1)  # Unused bytes
-        clockwise, randseed, n_z, n_y = unpack(e + '4l', fl.read(16))
-        fl.seek(24, 1)  # Unused bytes
-        nbt = ncomp * n_y * n_z * n_t
-        turb = np.rollaxis(np.fromstring(fl.read(2 * nbt), dtype=np.int16)
-                          .astype(np.float32).reshape([ncomp,
-                                                       n_y,
-                                                       n_z,
-                                                       n_t], order='F'),
-                          2, 1)
-    turb[0] += 1000.0 / ti[0]
-    turb /= 1000. / (uhub * ti[:, None, None, None])
-    # Create the grid object:
-    dt = dx / uhub
-    # Determine the clockwise value.
-    if clockwise == 0:
-        try:
-            d = sum_scan(convname(fname, '.sum'))
-            clockwise = d['clockwise']
-        except IOError:
-            warn("Value of 'CLOCKWISE' not specified in binary file, "
-                 "and no .sum file found. Assuming CLOCKWISE = True.")
-            clockwise = True
-        except KeyError:
-            warn("Value of 'CLOCKWISE' not specified in binary file, "
-                 "and %s has no line containing 'clockwise'. Assuming "
-                 "CLOCKWISE = True." % convname(fname, '.sum'))
-            clockwise = True
-    else:
-        clockwise = bool(clockwise - 1)
-    if clockwise:
-        # flip the data back
-        turb = turb[:, :, ::-1, :]
-
-    return turb, dt
-
-
-def turbsim(fname):
-    """
-    Read TurbSim format (.bts) full-field time-series binary
-    data files.
-
-    Parameters
-    ----------
-    fname : str
-            The filename from which to read the data.
-
-    Returns
-    -------
-    turb : :class:`numpy.ndarray`
-             [3 x n_z x n_y x n_t] array of wind velocity values
-
-    """
-    e = '<'         # define "endianness"
-    fname = checkname(fname, ['.bts'])
-    u_scl = np.zeros(3, np.float32)
-    u_off = np.zeros(3, np.float32)
-    fl = file(fname, 'rb')
-    (junk,
-     n_z,
-     n_y,
-     n_tower,
-     n_t,
-     dz,
-     dy,
-     dt,
-     uhub,
-     zhub,
-     z0,
-     u_scl[0],
-     u_off[0],
-     u_scl[1],
-     u_off[1],
-     u_scl[2],
-     u_off[2],
-     strlen) = unpack(e + 'h4l12fl', fl.read(70))    
-    desc_str = fl.read(strlen)  # skip these bytes.
-    # load turbulent field
-    nbt = 3 * n_y * n_z * n_t
-    turb = np.rollaxis(np.fromstring(fl.read(2 * nbt), dtype=np.int16).astype(
-        np.float32).reshape([3, n_y, n_z, n_t], order='F'), 2, 1)
-    turb -= u_off[:, None, None, None]
-    turb /= u_scl[:, None, None, None]
-    return turb
-
-def sum_scan(filename,):
-    """
-    Scan a sum file for specific variables.
-
-    Parameters
-    ----------
-    filename : string
-        The file to scan.
-
-    Returns
-    -------
-    out : dict
-        A dictionary of values identified.
-    """
-    # Currently this routine only searches for 'clockwise'.
-    out = dict()
-    with open(checkname(filename, ['.sum', '.SUM']), 'r') as infl:
-        for ln in infl:
-            ln = ln.lower()
-            if 'clockwise' in ln.lower():
-                v = ln.split()[0]
-                if v in ['t', 'y']:
-                    out['clockwise'] = True
-                else:
-                    out['clockwise'] = False
-    return out
-    
-
-def convname(fname, extension=None):
-    """
-    Change the file extension.
-    """
-    if extension is None:
-        return fname
-    if extension != '' and not extension.startswith('.'):
-        extension = '.' + extension
-    return fname.rsplit('.', 1)[0] + extension
-
-def checkname(fname, extensions=[]):
-    """Test whether fname exists.
-
-    If it does not, change the file extension in the list of
-    extensions until a file is found. If no file is found this
-    function raises IOError.
-    """
-    if os.path.isfile(fname):
-        return fname
-    if isinstance(extensions, basestring):
-        # If extensions is a string make it a single-element list.
-        extensions = [extensions]
-    for e in extensions:
-        fnm = convname(fname, e)
-        if os.path.isfile(fnm):
-            return fnm
-    raise IOError("No such file or directory: '%s', and no "
-                  "files found with specified extensions." % fname)
