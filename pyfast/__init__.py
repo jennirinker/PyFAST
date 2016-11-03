@@ -15,13 +15,27 @@ import shutil
     
 
 def CalcLookupTable(TurbName,ModlDir,
-                    WindDir=None,WindSpeeds=None,
-                    FastExe='FAST.exe',version=7,TMax=140.,Tss=80.,
-                    clean=0,**kwargs):
-    """ 
+                    WindSpeeds=None,FastExe='FAST.exe',
+                    TMax=140.,Tss=80.,clean=0,overwrite=0,
+                    **kwargs):
+    """ Calculate and save steady-state look-up table
     
-    Wind speeds must be increasing
-    FAST must be on your system path or in the ModlDir
+        Runs a series of steady-state simulations using the previous
+        steady-state values as initial conditions. Saves all steady-state
+        values into a table and saves it.
+        
+        Note: the FAST executable must either be on the system path or in the
+        model directory.
+        
+        Args:
+            TurbName    (str) : name of turbine model
+            ModlDir     (str) : path to model directory (no trailing slash)
+            WindSpeeds (iter) : iterable of wind speeds at which to calculate
+                                steady-state values
+            FastExe     (str)
+            
+        Returns:
+            
     """
     
     # check if model directory exists
@@ -30,7 +44,7 @@ def CalcLookupTable(TurbName,ModlDir,
     
     # check if steady-state directory exists, overwrite if user allows
     SSDir = os.path.join(ModlDir,'steady-state')
-    if os.path.isdir(SSDir):
+    if os.path.isdir(SSDir) and not overwrite:
         try:                    # bind raw_input to input for Python 2
             input = raw_input
         except NameError:
@@ -42,6 +56,8 @@ def CalcLookupTable(TurbName,ModlDir,
             return None
         else:
             raise ValueError('Unknown response {}'.format(UserResp))
+    elif os.path.isdir(SSDir) and overwrite:
+        shutil.rmtree(SSDir)
     os.mkdir(SSDir)
     
     # define default wind speeds, ensure monotonically increasing
@@ -49,10 +65,6 @@ def CalcLookupTable(TurbName,ModlDir,
         WindSpeeds = np.arange(3,25,0.5)
     else:
         WindSpeeds = np.sort(np.array(WindSpeeds))
-        
-    # if the wind directory is not specified, make it the same as the SS directory
-    if WindDir is None:
-        WindDir = SSDir
     
     # define LUT name and path
     SSName = TurbName + '_SS.mat'
@@ -71,12 +83,10 @@ def CalcLookupTable(TurbName,ModlDir,
     for key in kwargs:
         if key in WindDict.keys():
             WindDict[key] = kwargs[key]
-            
-    # TODO: fix where we're writing files, how to delete them
-    # TODO: exe name?
     
     # loop through wind speeds
     NumIDs = int(np.ceil(np.log10(len(WindSpeeds))))
+    
     for iWS in range(len(WindSpeeds)):
         WindSpeed = WindSpeeds[iWS]
         
@@ -89,13 +99,14 @@ def CalcLookupTable(TurbName,ModlDir,
         WindName = 'NoShr_'+'{:2.1f}'.format(WindSpeed).zfill(4)+'.wnd'
         
         # check if wind file exists, make it if not
-        WindPath = os.path.join(WindDir,WindName)
+        WindPath = os.path.join(SSDir,WindName)
         if not os.path.exists(WindPath):
             WriteSteadyWind(WindSpeed,WindPath)
                 
         # write FAST input files
         FastName = TurbName + '_' + fileID
-        FastPath = os.path.join(SSDir,FastName)
+        FastPath = os.path.join(ModlDir,FastName)
+        SSFastPath = os.path.join(SSDir,FastName)
         WriteFastAD(TurbName,WindPath,ModlDir,
                     FastDir=ModlDir,FastName=FastName,
                     **WindDict)
@@ -109,13 +120,13 @@ def CalcLookupTable(TurbName,ModlDir,
                       
         # load FAST files
         FASTdf = ReadFASTFile(FastName + '.out')
-        Fields = FASTdf.columns
+        Fields = [s for s in FASTdf.columns]
         
         # initialize LUT if it doesn't exist
         if iWS == 0: LUT = np.empty((len(WindSpeeds),len(Fields)))
         
         # loop through and save steady-state values
-        n_t = FASTdf['Time'].size*Tss/TMax
+        n_t = int(FASTdf['Time'].size*Tss/TMax)
         for i_parm in range(len(Fields)):
             
             # get data
@@ -135,9 +146,11 @@ def CalcLookupTable(TurbName,ModlDir,
 
         # delete fst, ipt files, move .out
         os.system('del {}'.format(WindPath))
-        os.system('del {}'.format(FastPath))
-#        os.system('del ' + FastName + '.out')
-        os.system('del ' + FastName + '_AD.ipt')
+        os.system('del {}.fst'.format(FastPath))
+        os.system('del {}_AD.ipt'.format(FastPath))
+        os.system('del {}.sum'.format(FastPath))
+        os.system('move {}.out {}.out'.format(FastPath,
+                                                SSFastPath))
     
     print('Simulations completed.')    
        
@@ -150,6 +163,7 @@ def CalcLookupTable(TurbName,ModlDir,
     LUTdict['Fields'] = Fields 
     scio.savemat(SSPath,LUTdict)
     print('Look-up table saved.')
+    
     return LUT 
     
 
