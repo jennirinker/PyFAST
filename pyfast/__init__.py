@@ -14,8 +14,9 @@ import scipy.io as scio
 import shutil 
     
 
-def CalcLookupTable(TurbName,ModlDir,WindDir=None,
-                    version=7,WindSpeeds=None,TMax=140.,Tss=80.,
+def CalcLookupTable(TurbName,ModlDir,
+                    WindDir=None,WindSpeeds=None,
+                    FastExe='FAST.exe',version=7,TMax=140.,Tss=80.,
                     clean=0,**kwargs):
     """ 
     
@@ -30,14 +31,18 @@ def CalcLookupTable(TurbName,ModlDir,WindDir=None,
     # check if steady-state directory exists, overwrite if user allows
     SSDir = os.path.join(ModlDir,'steady-state')
     if os.path.isdir(SSDir):
+        try:                    # bind raw_input to input for Python 2
+            input = raw_input
+        except NameError:
+            pass
         UserResp = input('Steady-state directory already exists. Overwrite? [y/n] ')
         if UserResp in ['y','Y',1]:
-            shutil.rmtree('SSDir')
-            os.mkdir(SSDir)
+            shutil.rmtree(SSDir)
         elif UserResp in ['n','N',0]:
             return None
         else:
             raise ValueError('Unknown response {}'.format(UserResp))
+    os.mkdir(SSDir)
     
     # define default wind speeds, ensure monotonically increasing
     if WindSpeeds is None:
@@ -54,7 +59,7 @@ def CalcLookupTable(TurbName,ModlDir,WindDir=None,
     SSPath = os.path.join(SSDir,SSName)
     
     # change directory to steady-state directory to run FAST
-    os.chdir(SSDir)
+    os.chdir(ModlDir)
     
     # define initial dictionary of default wind-dependent parameters
     WindDict = {'BlPitch(1)':0.,'BlPitch(2)':0.,'BlPitch(3)':0.,
@@ -92,14 +97,14 @@ def CalcLookupTable(TurbName,ModlDir,WindDir=None,
         FastName = TurbName + '_' + fileID
         FastPath = os.path.join(SSDir,FastName)
         WriteFastAD(TurbName,WindPath,ModlDir,
-                    FastDir=SSDir,FastName=FastName,
+                    FastDir=ModlDir,FastName=FastName,
                     **WindDict)
                   
         # run FAST
-        command  = 'FAST.exe ' + FastName + '.fst' 
+        command  = ' '.join([FastExe,FastName + '.fst' ])
         ExitCode = os.system(command)
         if ExitCode:
-            print('WARNING: FAST did not complete successfully ' + \
+            raise ValueError('FAST did not complete successfully ' + \
                     '(Wind speed {:.1f}, exit code {:.0f})'.format(WindSpeed,ExitCode))
                       
         # load FAST files
@@ -128,11 +133,11 @@ def CalcLookupTable(TurbName,ModlDir,WindDir=None,
             elif key+'1' in Fields:
                 WindDict[key] = LUT[iWS,Fields.index(key+'1')]
 
-        # delete input files, move to steady-state
-        if clean:
-            os.system('del ' + FastName + '.fst')
-            os.system('del ' + FastName + '.out')
-            os.system('del ' + FastName + '_AD.ipt')
+        # delete fst, ipt files, move .out
+        os.system('del {}'.format(WindPath))
+        os.system('del {}'.format(FastPath))
+#        os.system('del ' + FastName + '.out')
+        os.system('del ' + FastName + '_AD.ipt')
     
     print('Simulations completed.')    
        
