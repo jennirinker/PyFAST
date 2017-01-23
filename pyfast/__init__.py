@@ -377,16 +377,15 @@ def WriteFastAD(TurbName,WindPath,ModlDir,
              
     # define default parameters specific to linearization
     if lin:
-        WindDict['LinFile']     = 'unused'
+        WindDict['LinFile']     = os.path.join(FastDir,TurbName+'_Linear.dat')
         WindDict['CompAero']    = 'False'
         WindDict['PCMode']      = 0
-        WindDict['TMax']        = 10.
+        WindDict['TMax']        = 30.
         WindDict['TStart']      = 0.
         WindDict['StallMod']    = 'STEADY'
         WindDict['AnalMode']    = 2
         WindDict['Gravity']     = 0.
-        WindDict['GenDOF']      = 'True'
-        WindDict['LinFile']     = os.path.join(FastDir,TurbName+'_Linear.dat')
+        WindDict['GenDOF']      = 'False'
         WindDict['FastOutputs'] = None
     else:
         WindDict['LinFile']     = 'unused'
@@ -406,11 +405,17 @@ def WriteFastAD(TurbName,WindPath,ModlDir,
             WindDict[key] = kwargs[key]
     
     # check if steady-state look-up table exists
-    LUTPath = os.path.join(ModlDir,'steady_state',
+    LUTPath = os.path.join(ModlDir,'steady-state',
                            TurbName+'_SS.mat')
                                       
-    #    if LUT exists, load unspecific initial condition values
-    if os.path.exists(LUTPath):
+    # print message if verbose and LUT doesn't exist
+    if not os.path.exists(LUTPath):
+        if verbose:
+            print('  WARNING: look-up table {:s} '.format(LUTPath) + \
+                    'not found. Using defaults.')
+        
+    # if LUT exists, load unspecific initial condition values
+    else:
         if verbose:
             print('  Interpolating unspecified IC values from ' + \
                     'look-up table {:s}'.format(LUTPath))
