@@ -16,7 +16,7 @@ import shutil
 
 def CalcLookupTable(TurbName,ModlDir,
                     WindSpeeds=None,FastExe='FAST.exe',
-                    TMax=140.,Tss=80.,clean=0,overwrite=0,
+                    TMax=140.,Tss=80.,overwrite=0,
                     **kwargs):
     """ Calculate and save steady-state look-up table
     
@@ -32,10 +32,13 @@ def CalcLookupTable(TurbName,ModlDir,
             ModlDir     (str) : path to model directory (no trailing slash)
             WindSpeeds (iter) : iterable of wind speeds at which to calculate
                                 steady-state values
-            FastExe     (str)
+            FastExe     (str) : name of FAST executable to simulate turbine
+            TMax        (flt) : total simulation time
+            Tss         (flt) : averaging time for calculating steady-state
+            overwrite   (int) : force directory overwrite without asking
             
         Returns:
-            
+            LUT        (dict) : look-up table 
     """
     
     # check if model directory exists
@@ -167,7 +170,7 @@ def CalcLookupTable(TurbName,ModlDir,
     return LUT 
     
 
-def DefaultOutputs():
+def GetDefaultOutputs():
     """ Defaults outputs for FAST time-marching analysis
     
         Returns:
@@ -201,7 +204,7 @@ def DefaultOutputs():
 	
  
 def GetFirstWind(WindPath):
-    """ First wind speed from file
+    """ First wind speed from wind file
     
         Args:
             WindPath (string): path to wind file
@@ -259,6 +262,39 @@ def GetICKeys():
                 'RotSpeed','TTDspFA','TTDspSS']
     
     return IC_keys
+
+
+def GetTemplateDict():
+    """ Dictionary of number formats for creating template file
+                 
+    """
+    
+    TmplDict = {'ADFile':'\"{:s}\"   	   ',
+                'AeroFile':'\"{:s}\"        ',
+                'AnalMode':'   {:.0f}        ',
+                'Azimuth':'{:6.1f}     ',
+                'BlPitch(1)':'{:6.1f}      ',
+                'BlPitch(2)':'{:6.1f}      ',
+                'BlPitch(3)':'{:6.1f}      ',
+                'CompAero':'{:<5s}       ',
+                'FastOutPuts':'{:s} ',
+                'GenDOF':'{:<5s}       ',
+                'Gravity':'   {:7.5f}  ',
+                'IPDefl':'{:6.1f}     ',
+                'LinFile':'\"{:s}\"    ',
+                'OoPDefl':'{:6.1f}     ',
+                'NacYaw':'{:6.1f}     ',
+                'PCMode':'   {:.0f}        ',
+                'RotSpeed':'{:6.1f}     ',
+                'StallMod':'{:<7s}                                ',
+                'TeetDefl':'{:6.1f}     ',
+                'TStart':'{:5.1f}       ',
+                'TTDspFA':'{:6.1f}     ',
+                'TTDspSS':'{:6.1f}     ',
+                'TMax':'{:8.1f}    ',
+                'WindFile':'\"{:s}\"			   '}
+                      
+    return TmplDict
 
 
 def ReadFASTFile(FilePath):
@@ -397,7 +433,7 @@ def WriteFastAD(TurbName,WindPath,ModlDir,
         WindDict['AnalMode']    = 1
         WindDict['Gravity']     = 9.80665
         WindDict['GenDOF']      = 'True'
-        WindDict['FastOutputs'] = DefaultOutputs()
+        WindDict['FastOutputs'] = GetDefaultOutputs()
             
     # set values of passed-in keyword arguments
     for key in kwargs:
@@ -577,5 +613,90 @@ def WriteSteadyWind(WindSpeed,WindPath):
         f.write('   0.1\t{:.1f}\t0.0\t0.0\t0.0\t0.0\t0.0\t0.0\n'.format(WindSpeed))
         f.write('9999.9\t{:.1f}\t0.0\t0.0\t0.0\t0.0\t0.0\t0.0\n'.format(WindSpeed))
         
+    return
+
+
+def WriteTemplate(TurbName,FastDir,
+                  version=7,**kwargs):
+    """ Create template file from FAST model
+                 
+    """
+    
+    # create and save filenames
+    TmplDir = os.path.join(FastDir,'templates')
+    ADTmplPath = os.path.join(TmplDir,TurbName+'_AD_template.ipt')
+    ADName   = '{:s}_AD.ipt'.format(TurbName)
+    ADPath     = os.path.join(FastDir,ADName)
+    FastName = '{:s}.fst'.format(TurbName)
+    FastTmplPath = os.path.join(TmplDir,TurbName+'_template.fst')
+    FastPath  = os.path.join(FastDir,FastName)
+    
+    # get dictionary of template keys
+    TmplDict = GetTemplateDict()
+    
+    # write AeroDyn template file
+    with open(ADPath,'r') as OrigFile:
+        with open(ADTmplPath,'w') as TmplFile:
+            for Line in OrigFile:
+                NewLine = Line
+                SplitLine = Line.split()
+                if len(SplitLine) > 1:
+                    if SplitLine[1] in TmplDict.keys():
+                        Key = SplitLine[1]
+                        Fmt = TmplDict[Key]
+                        NewLine = Fmt + Key + Line.split(Key)[1]
+                TmplFile.write(NewLine)
+                
+    # write FAST file
+    OutputLine = 0
+    with open(FastPath,'r') as OrigFile:
+        with open(FastTmplPath,'w') as TmplFile:
+            for Line in OrigFile:
+                NewLine = Line
+                SplitLine = Line.split()
+                if 'END' in SplitLine[0]:
+                    OutputLine = 0
+                elif OutputLine:
+                    NewLine = ''
+                elif len(SplitLine) > 1:
+                    if 'OutList' in SplitLine[0]:
+                        OutputLine = 1
+                        NewLine += '{:s} FastOutputs\n'
+                    elif SplitLine[1] in TmplDict.keys():
+                        Key = SplitLine[1]
+                        Fmt = TmplDict[Key]
+                        NewLine = Fmt + Key + Line.split(Key)[1]
+                TmplFile.write(NewLine)
+        
+    # if FAST version is 8, also write ElastoDyn file
+    if (version == 8):
+        # TODO: CONTINUE SORTING OUT format keys
+        # create and save filepaths
+        EDTmplPath = os.path.join(TmplDir,TurbName+'_ElastoDyn_template.dat')
+        EDName   = '{:s}_ElastoDyn.dat'.format(TurbName)
+        EDPath     = os.path.join(FastDir,EDName)
+              
+        # write ElastoDyn file
+        OutputLine = 0
+        with open(EDPath,'r') as OrigFile:
+            with open(EDTmplPath,'w') as TmplFile:
+                for Line in OrigFile:
+                    NewLine = Line
+                    SplitLine = Line.split()
+                    if 'END' in SplitLine[0]:
+                        OutputLine = 0
+                    elif OutputLine:
+                        NewLine = ''
+                    elif len(SplitLine) > 1:
+                        if 'OutList' in SplitLine[0]:
+                            OutputLine = 1
+                            NewLine += '{:s} FastOutputs\n'
+                        elif SplitLine[1] in TmplDict.keys():
+                            Key = SplitLine[1]
+                            Fmt = TmplDict[Key]
+                            NewLine = Fmt + Key + Line.split(Key)[1]
+                    TmplFile.write(NewLine)
+    
+                      
     return
 
