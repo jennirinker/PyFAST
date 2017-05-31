@@ -416,7 +416,7 @@ def WriteFastAD(TurbName,WindPath,ModlDir,
         WindDict['LinFile']     = os.path.join(FastDir,TurbName+'_Linear.dat')
         WindDict['CompAero']    = 'False'
         WindDict['PCMode']      = 0
-        WindDict['TMax']        = 30.
+        WindDict['TMax']        = 300.
         WindDict['TStart']      = 0.
         WindDict['StallMod']    = 'STEADY'
         WindDict['AnalMode']    = 2
